@@ -1,6 +1,5 @@
 package eu.kanade.tachiyomi.extension.zh.bakamh
 
-import android.webkit.CookieManager
 import eu.kanade.tachiyomi.multisrc.madara.Madara
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
@@ -17,10 +16,10 @@ import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
-import java.security.MessageDigest
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 import javax.crypto.Cipher
+import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
@@ -31,7 +30,6 @@ abstract class Bakamh : Madara() {
     override fun OkHttpClient.Builder.configureClient() = apply {
         addInterceptor(UserAgentClientHintsInterceptor())
         addInterceptor(BtWafInterceptor())
-        addNetworkInterceptor(BtWafNetworkInterceptor())
         rateLimit(2)
     }
 
@@ -141,47 +139,6 @@ abstract class Bakamh : Madara() {
         return document
     }
 
-    private class BtWafNetworkInterceptor : Interceptor {
-        override fun intercept(chain: Interceptor.Chain): Response {
-            val request = chain.request()
-            val userAgent = request.header("User-Agent")
-                ?: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
-
-            // 动态提取 btwaf cookie 名称和哈希值
-            val html = runCatching {
-                chain.proceed(request).peekBody(Long.MAX_VALUE).string()
-            }.getOrNull() ?: ""
-
-            val cookieName = Regex("""['"](btwaf-[0-9a-fA-F-]+)['"]""").find(html)?.groupValues?.get(1)
-            val cookieValue = MessageDigest.getInstance("SHA-256")
-                .digest(userAgent.toByteArray(Charsets.UTF_8))
-                .joinToString("") { "%02x".format(it) }
-
-            val existingCookie = request.header("Cookie").orEmpty()
-            val mergedCookie = if (cookieName != null && !existingCookie.contains(cookieName)) {
-                if (existingCookie.isEmpty()) "$cookieName=$cookieValue" else "$existingCookie; $cookieName=$cookieValue"
-            } else {
-                existingCookie
-            }
-
-            val newRequest = request.newBuilder()
-                .header("User-Agent", userAgent)
-                .header("Cookie", mergedCookie)
-                .build()
-
-            runCatching {
-                if (cookieName != null) {
-                    CookieManager.getInstance().setCookie("https://bakamh.com", "$cookieName=$cookieValue; Path=/; Max-Age=2592000")
-                }
-            }
-
-            // 继续执行请求链，但需要重新构建响应体，因为 peekBody 已经消费了一次
-            return chain.proceed(newRequest).newBuilder()
-                .body(html.toResponseBody(response.body.contentType()))
-                .build()
-        }
-    }
-
     private class BtWafInterceptor : Interceptor {
         override fun intercept(chain: Interceptor.Chain): Response {
             val request = chain.request()
@@ -211,21 +168,38 @@ abstract class Bakamh : Madara() {
         @Volatile
         var lastDecryptError: String? = null
 
+        /**
+         * 同时兼容宝塔 WAF 的 AES-GCM (32字节Key + 12字节IV + 16字节Tag)
+         * 与 AES-CBC (16字节Key + 16字节IV，无Tag) 两种动态加密模板
+         */
         fun decryptBtWaf(html: String): String? {
             return try {
-                val rawKey = extractByteArray(html, "raw_key", 16) ?: error("raw_key (16 bytes) not found")
-                val iv = extractByteArray(html, "iv", 16) ?: error("iv (16 bytes) not found") // 修正为 16 字节
-                val tag = extractByteArray(html, "tag", 16) ?: error("tag (16 bytes) not found")
-                val encryptedHex = extractEncryptedHex(html) ?: error("encrypted hex not found")
+                val rawKey = extractRawKey(html) ?: error("raw_key not found")
+                val iv = extractIv(html) ?: error("iv not found")
+                val tag = extractTag(html)
+                val ciphertext = extractEncryptedHex(html) ?: error("encrypted hex not found")
 
-                val ciphertext = ByteArray(encryptedHex.length / 2) { i ->
-                    encryptedHex.substring(i * 2, i * 2 + 2).toInt(16).toByte()
+                val decryptedBytes = if (tag != null && iv.size == 12) {
+                    // 模板 A: AES-GCM 模式
+                    val ciphertextWithTag = ciphertext + tag
+                    val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+                    cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(rawKey, "AES"), GCMParameterSpec(128, iv))
+                    cipher.doFinal(ciphertextWithTag)
+                } else {
+                    // 模板 B: AES-CBC 模式
+                    try {
+                        val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
+                        cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(rawKey, "AES"), IvParameterSpec(iv))
+                        cipher.doFinal(ciphertext)
+                    } catch (_: Exception) {
+                        val cipher = Cipher.getInstance("AES/CBC/NoPadding")
+                        cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(rawKey, "AES"), IvParameterSpec(iv))
+                        val raw = cipher.doFinal(ciphertext)
+                        var len = raw.size
+                        while (len > 0 && raw[len - 1] in 0..16) len--
+                        raw.copyOf(len)
+                    }
                 }
-
-                // AES/CBC/PKCS5Padding 解密
-                val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
-                cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(rawKey, "AES"), IvParameterSpec(iv))
-                val decryptedBytes = cipher.doFinal(ciphertext)
 
                 lastDecryptError = null
                 String(decryptedBytes, Charsets.UTF_8)
@@ -235,25 +209,54 @@ abstract class Bakamh : Madara() {
             }
         }
 
-        // 统一的字节数组提取函数，通过锚点和预期长度更健壮地提取参数
-        private fun extractByteArray(html: String, anchor: String, expectedLength: Int): ByteArray? {
-            val startAnchor = "var $anchor=["
-            val idx = html.indexOf(startAnchor).takeIf { it != -1 } ?: return null
-            val start = idx + startAnchor.length
+        private fun extractRawKey(html: String): ByteArray? {
+            val idx = html.indexOf("raw_key").takeIf { it != -1 } ?: return null
+            val start = html.indexOf('[', idx).takeIf { it != -1 } ?: return null
             val end = html.indexOf(']', start).takeIf { it != -1 } ?: return null
-
-            val bytes = html.substring(start, end).split(",")
+            val bytes = html.substring(start + 1, end).split(",")
                 .mapNotNull { it.trim().toIntOrNull()?.toByte() }
                 .toByteArray()
-            return bytes.takeIf { it.size == expectedLength }
+            return bytes.takeIf { it.size == 16 || it.size == 24 || it.size == 32 }
+        }
+
+        private fun extractIv(html: String): ByteArray? {
+            val idx = html.indexOf("var iv").takeIf { it != -1 }
+                ?: html.indexOf("iv = new Uint8Array").takeIf { it != -1 }
+                ?: html.indexOf("iv=new Uint8Array").takeIf { it != -1 }
+                ?: html.indexOf("iv = [").takeIf { it != -1 }
+                ?: html.indexOf("iv=[").takeIf { it != -1 }
+                ?: return null
+            val start = html.indexOf('[', idx).takeIf { it != -1 } ?: return null
+            val end = html.indexOf(']', start).takeIf { it != -1 } ?: return null
+            val bytes = html.substring(start + 1, end).split(",")
+                .mapNotNull { it.trim().toIntOrNull()?.toByte() }
+                .toByteArray()
+            return bytes.takeIf { it.size == 12 || it.size == 16 }
+        }
+
+        private fun extractTag(html: String): ByteArray? {
+            val idx = html.indexOf("var tag").takeIf { it != -1 }
+                ?: html.indexOf("tag = new Uint8Array").takeIf { it != -1 }
+                ?: html.indexOf("tag=new Uint8Array").takeIf { it != -1 }
+                ?: html.indexOf("tag = [").takeIf { it != -1 }
+                ?: html.indexOf("tag=[").takeIf { it != -1 }
+                ?: return null
+            val start = html.indexOf('[', idx).takeIf { it != -1 } ?: return null
+            val end = html.indexOf(']', start).takeIf { it != -1 } ?: return null
+            val bytes = html.substring(start + 1, end).split(",")
+                .mapNotNull { it.trim().toIntOrNull()?.toByte() }
+                .toByteArray()
+            return bytes.takeIf { it.size == 16 }
         }
 
         private fun extractEncryptedHex(html: String): ByteArray? {
-            val startAnchor = "var encrypted=\""
-            val idx = html.indexOf(startAnchor).takeIf { it != -1 } ?: return null
-            val start = idx + startAnchor.length
-            val end = html.indexOf("\";", start).takeIf { it != -1 } ?: return null // 注意这里的分号和引号
-            val hex = html.substring(start, end).trim()
+            val idx = html.indexOf("var encrypted").takeIf { it != -1 }
+                ?: html.indexOf("encrypted").takeIf { it != -1 }
+                ?: return null
+            val q1 = html.indexOf('"', idx).takeIf { it != -1 } ?: html.indexOf('\'', idx).takeIf { it != -1 } ?: return null
+            val quoteChar = html[q1]
+            val q2 = html.indexOf(quoteChar, q1 + 1).takeIf { it != -1 } ?: return null
+            val hex = html.substring(q1 + 1, q2).trim()
             if (hex.length < 32 || hex.length % 2 != 0) return null
             return ByteArray(hex.length / 2) { i ->
                 hex.substring(i * 2, i * 2 + 2).toInt(16).toByte()
