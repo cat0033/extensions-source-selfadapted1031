@@ -169,8 +169,7 @@ abstract class Bakamh : Madara() {
         var lastDecryptError: String? = null
 
         /**
-         * 同时兼容宝塔 WAF 的 AES-GCM (32字节Key + 12字节IV + 16字节Tag)
-         * 与 AES-CBC (16字节Key + 16字节IV，无Tag) 两种动态加密模板
+         * 全能多模式自适应解密：自动探测 GCM / CTR / CBC / CFB 算法并消除填充块限制
          */
         fun decryptBtWaf(html: String): String? {
             return try {
@@ -179,34 +178,69 @@ abstract class Bakamh : Madara() {
                 val tag = extractTag(html)
                 val ciphertext = extractEncryptedHex(html) ?: error("encrypted hex not found")
 
-                val decryptedBytes = if (tag != null && iv.size == 12) {
-                    // 模板 A: AES-GCM 模式
-                    val ciphertextWithTag = ciphertext + tag
-                    val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-                    cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(rawKey, "AES"), GCMParameterSpec(128, iv))
-                    cipher.doFinal(ciphertextWithTag)
-                } else {
-                    // 模板 B: AES-CBC 模式
-                    try {
-                        val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
-                        cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(rawKey, "AES"), IvParameterSpec(iv))
-                        cipher.doFinal(ciphertext)
-                    } catch (_: Exception) {
-                        val cipher = Cipher.getInstance("AES/CBC/NoPadding")
-                        cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(rawKey, "AES"), IvParameterSpec(iv))
-                        val raw = cipher.doFinal(ciphertext)
-                        var len = raw.size
-                        while (len > 0 && raw[len - 1] in 0..16) len--
-                        raw.copyOf(len)
+                val keySpec = SecretKeySpec(rawKey, "AES")
+                var decryptedBytes: ByteArray? = null
+
+                // 1. 如果带有 16 字节 Tag 且 IV 为 12 字节，优先走 GCM
+                if (tag != null && iv.size == 12) {
+                    runCatching {
+                        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+                        cipher.init(Cipher.DECRYPT_MODE, keySpec, GCMParameterSpec(128, iv))
+                        decryptedBytes = cipher.doFinal(ciphertext + tag)
                     }
                 }
 
+                // 2. 尝试流密码模式 CTR（无块大小对齐限制，可解密任意长度密文）
+                if (decryptedBytes == null && iv.size == 16) {
+                    runCatching {
+                        val cipher = Cipher.getInstance("AES/CTR/NoPadding")
+                        cipher.init(Cipher.DECRYPT_MODE, keySpec, IvParameterSpec(iv))
+                        val candidate = cipher.doFinal(ciphertext)
+                        if (candidate.isValidHtml()) decryptedBytes = candidate
+                    }
+                }
+
+                // 3. 尝试 CBC 模式（自动对齐 16 字节块长度）
+                if (decryptedBytes == null && iv.size == 16) {
+                    runCatching {
+                        val alignedCiphertext = if (ciphertext.size % 16 != 0) {
+                            val padLen = 16 - (ciphertext.size % 16)
+                            ciphertext + ByteArray(padLen)
+                        } else {
+                            ciphertext
+                        }
+                        val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
+                        cipher.init(Cipher.DECRYPT_MODE, keySpec, IvParameterSpec(iv))
+                        val candidate = cipher.doFinal(alignedCiphertext)
+                        if (candidate.isValidHtml()) decryptedBytes = candidate
+                    }
+                }
+
+                // 4. 尝试 CFB 模式
+                if (decryptedBytes == null && iv.size == 16) {
+                    runCatching {
+                        val cipher = Cipher.getInstance("AES/CFB/NoPadding")
+                        cipher.init(Cipher.DECRYPT_MODE, keySpec, IvParameterSpec(iv))
+                        val candidate = cipher.doFinal(ciphertext)
+                        if (candidate.isValidHtml()) decryptedBytes = candidate
+                    }
+                }
+
+                if (decryptedBytes == null) {
+                    error("All AES algorithms failed (keySize=${rawKey.size}, ivSize=${iv.size}, cipherSize=${ciphertext.size})")
+                }
+
                 lastDecryptError = null
-                String(decryptedBytes, Charsets.UTF_8)
+                String(decryptedBytes!!, Charsets.UTF_8)
             } catch (e: Throwable) {
                 lastDecryptError = "${e.javaClass.simpleName}: ${e.message}"
                 null
             }
+        }
+
+        private fun ByteArray.isValidHtml(): Boolean {
+            val head = String(this.take(200).toByteArray(), Charsets.UTF_8).lowercase(Locale.ROOT)
+            return head.contains("<html") || head.contains("<!doctype") || head.contains("<div") || head.contains("<head")
         }
 
         private fun extractRawKey(html: String): ByteArray? {
@@ -225,6 +259,7 @@ abstract class Bakamh : Madara() {
                 ?: html.indexOf("iv=new Uint8Array").takeIf { it != -1 }
                 ?: html.indexOf("iv = [").takeIf { it != -1 }
                 ?: html.indexOf("iv=[").takeIf { it != -1 }
+                ?: html.indexOf("iv=").takeIf { it != -1 }
                 ?: return null
             val start = html.indexOf('[', idx).takeIf { it != -1 } ?: return null
             val end = html.indexOf(']', start).takeIf { it != -1 } ?: return null
@@ -250,15 +285,15 @@ abstract class Bakamh : Madara() {
         }
 
         private fun extractEncryptedHex(html: String): ByteArray? {
-            val idx = html.indexOf("var encrypted").takeIf { it != -1 }
-                ?: html.indexOf("encrypted").takeIf { it != -1 }
-                ?: return null
+            val idx = html.indexOf("encrypted").takeIf { it != -1 } ?: return null
             val q1 = html.indexOf('"', idx).takeIf { it != -1 } ?: html.indexOf('\'', idx).takeIf { it != -1 } ?: return null
             val quoteChar = html[q1]
             val q2 = html.indexOf(quoteChar, q1 + 1).takeIf { it != -1 } ?: return null
-            val hex = html.substring(q1 + 1, q2).trim()
-            if (hex.length < 32 || hex.length % 2 != 0) return null
-            return ByteArray(hex.length / 2) { i ->
+            // 清理一切空白字符与回车，防止字符错位
+            val hex = html.substring(q1 + 1, q2).filter { !it.isWhitespace() }
+            if (hex.length < 32) return null
+            val validLen = if (hex.length % 2 != 0) hex.length - 1 else hex.length
+            return ByteArray(validLen / 2) { i ->
                 hex.substring(i * 2, i * 2 + 2).toInt(16).toByte()
             }
         }
