@@ -31,6 +31,7 @@ abstract class Bakamh : Madara() {
     override fun OkHttpClient.Builder.configureClient() = apply {
         addInterceptor(UserAgentClientHintsInterceptor())
         addInterceptor(BtWafInterceptor())
+        addNetworkInterceptor(BtWafNetworkInterceptor()) // 在最底层网络层合并 Cookie
         rateLimit(2)
     }
 
@@ -63,7 +64,6 @@ abstract class Bakamh : Madara() {
 
     override suspend fun fetchChapterDocument(chapterUrl: String): Document {
         val rawDoc = super.fetchChapterDocument(chapterUrl)
-        // 确保拿到的是解密后的文档
         val document = ensureDecrypted(rawDoc)
 
         if (document.selectFirst(READER_CONFIG_SELECTOR) != null) {
@@ -97,7 +97,6 @@ abstract class Bakamh : Madara() {
         }
         doc.selectFirst(".mkjp-tool-warning")?.let { error(it.text()) }
 
-        // 全面扫描各种可能的图片属性，防止漏图
         val pages = doc.select("div.reading-content img, div.page-break img, img.wp-manga-chapter-img").mapNotNull { img ->
             val url = img.attr("abs:data-src").ifEmpty {
                 img.attr("abs:data-manga-src").ifEmpty {
@@ -115,7 +114,6 @@ abstract class Bakamh : Madara() {
             return pages.mapIndexed { index, url -> Page(index, doc.location(), url) }
         }
 
-        // 旧逻辑备用
         val config = doc.selectFirst(READER_CONFIG_SELECTOR)?.data()
         val slots = doc.select(READER_SLOT_SELECTOR).size
         if (!config.isNullOrEmpty() && slots > 0 && readerScript != null) {
@@ -125,12 +123,16 @@ abstract class Bakamh : Madara() {
             }
         }
 
-        error("Failed to read the page list")
+        // 输出精确诊断信息
+        error(
+            "Failed to read the page list: [Title='${doc.title()}'] [HTML len=${doc.html().length}] " +
+                "[Images found=${doc.select("img").size}] [IsWAF=${doc.html().contains("raw_key")}]",
+        )
     }
 
     private fun ensureDecrypted(document: Document): Document {
         val html = document.html()
-        if (html.contains("var raw_key") && html.contains("var encrypted")) {
+        if (html.contains("raw_key") && html.contains("encrypted")) {
             val decrypted = decryptBtWaf(html)
             if (!decrypted.isNullOrEmpty()) {
                 return Jsoup.parse(decrypted, document.location())
@@ -139,7 +141,10 @@ abstract class Bakamh : Madara() {
         return document
     }
 
-    private class BtWafInterceptor : Interceptor {
+    /**
+     * 网络层拦截器：负责在 OkHttp 合并完登录 Cookie 后，补全 btwaf 防火墙 Cookie
+     */
+    private class BtWafNetworkInterceptor : Interceptor {
         override fun intercept(chain: Interceptor.Chain): Response {
             val request = chain.request()
             val userAgent = request.header("User-Agent")
@@ -150,23 +155,28 @@ abstract class Bakamh : Madara() {
                 .digest(userAgent.toByteArray(Charsets.UTF_8))
                 .joinToString("") { "%02x".format(it) }
 
-            val existingCookie = request.header("Cookie")
-            val newCookie = when {
-                existingCookie.isNullOrEmpty() -> "$cookieName=$uaHash"
+            val existingCookie = request.header("Cookie").orEmpty()
+            val mergedCookie = when {
+                existingCookie.isEmpty() -> "$cookieName=$uaHash"
                 !existingCookie.contains(cookieName) -> "$existingCookie; $cookieName=$uaHash"
                 else -> existingCookie
             }
 
             val newRequest = request.newBuilder()
-                .header("User-Agent", userAgent)
-                .header("Cookie", newCookie)
+                .header("Cookie", mergedCookie)
                 .build()
 
-            runCatching {
-                CookieManager.getInstance().setCookie("https://bakamh.com", "$cookieName=$uaHash; Path=/; Max-Age=2592000")
-            }
+            return chain.proceed(newRequest)
+        }
+    }
 
-            val response = chain.proceed(newRequest)
+    /**
+     * 应用层拦截器：负责解析响应正文中的宝塔加密壳
+     */
+    private class BtWafInterceptor : Interceptor {
+        override fun intercept(chain: Interceptor.Chain): Response {
+            val request = chain.request()
+            val response = chain.proceed(request)
 
             val contentType = response.body.contentType()
             val subtype = contentType?.subtype?.lowercase(Locale.ROOT)
@@ -175,7 +185,7 @@ abstract class Bakamh : Madara() {
             }
 
             val bodyString = response.body.string()
-            if (!bodyString.contains("var raw_key") || !bodyString.contains("var encrypted")) {
+            if (!bodyString.contains("raw_key") || !bodyString.contains("encrypted")) {
                 return response.newBuilder()
                     .body(bodyString.toResponseBody(contentType))
                     .build()
@@ -191,26 +201,10 @@ abstract class Bakamh : Madara() {
     companion object {
         fun decryptBtWaf(html: String): String? {
             return runCatching {
-                val rawKeyStr = html.substringAfter("var raw_key = [", "")
-                    .substringBefore("]", "")
-                    .ifEmpty { return null }
-                val encryptedHex = html.substringAfter("var encrypted = \"", "")
-                    .substringBefore("\"", "")
-                    .ifEmpty { return null }
-                val tagStr = html.substringAfter("var tag = new Uint8Array([", "")
-                    .substringBefore("]", "")
-                    .ifEmpty { return null }
-                val ivStr = html.substringAfter("var iv = new Uint8Array([", "")
-                    .substringBefore("]", "")
-                    .ifEmpty { return null }
-
-                val rawKey = rawKeyStr.split(",").map { it.trim().toInt().toByte() }.toByteArray()
-                val iv = ivStr.split(",").map { it.trim().toInt().toByte() }.toByteArray()
-                val tag = tagStr.split(",").map { it.trim().toInt().toByte() }.toByteArray()
-
-                val ciphertext = ByteArray(encryptedHex.length / 2) { i ->
-                    encryptedHex.substring(i * 2, i * 2 + 2).toInt(16).toByte()
-                }
+                val rawKey = extractBytesBetween(html, "raw_key", '[', ']') ?: return null
+                val iv = extractBytesBetween(html, "iv", '[', ']') ?: return null
+                val tag = extractBytesBetween(html, "tag", '[', ']') ?: return null
+                val ciphertext = extractEncryptedHex(html) ?: return null
 
                 val ciphertextWithTag = ciphertext + tag
                 val cipher = Cipher.getInstance("AES/GCM/NoPadding")
@@ -218,6 +212,34 @@ abstract class Bakamh : Madara() {
                 val decryptedBytes = cipher.doFinal(ciphertextWithTag)
                 String(decryptedBytes, Charsets.UTF_8)
             }.getOrNull()
+        }
+
+        private fun extractBytesBetween(html: String, anchor: String, openChar: Char, closeChar: Char): ByteArray? {
+            val idx = html.indexOf(anchor)
+            if (idx == -1) return null
+            val start = html.indexOf(openChar, idx)
+            if (start == -1) return null
+            val end = html.indexOf(closeChar, start)
+            if (end == -1) return null
+            return html.substring(start + 1, end).split(",")
+                .mapNotNull { it.trim().toIntOrNull()?.toByte() }
+                .toByteArray()
+                .takeIf { it.isNotEmpty() }
+        }
+
+        private fun extractEncryptedHex(html: String): ByteArray? {
+            val idx = html.indexOf("encrypted")
+            if (idx == -1) return null
+            val q1 = html.indexOf('"', idx).takeIf { it != -1 } ?: html.indexOf('\'', idx)
+            if (q1 == -1) return null
+            val quoteChar = html[q1]
+            val q2 = html.indexOf(quoteChar, q1 + 1)
+            if (q2 == -1) return null
+            val hex = html.substring(q1 + 1, q2).trim()
+            if (hex.length < 32 || hex.length % 2 != 0) return null
+            return ByteArray(hex.length / 2) { i ->
+                hex.substring(i * 2, i * 2 + 2).toInt(16).toByte()
+            }
         }
     }
 }
