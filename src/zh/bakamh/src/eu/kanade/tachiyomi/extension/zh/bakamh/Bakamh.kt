@@ -31,7 +31,7 @@ abstract class Bakamh : Madara() {
     override fun OkHttpClient.Builder.configureClient() = apply {
         addInterceptor(UserAgentClientHintsInterceptor())
         addInterceptor(BtWafInterceptor())
-        rateLimit(2) // Rate limit added to prevent 429 errors during library updates
+        rateLimit(2)
     }
 
     override fun Headers.Builder.configureHeaders() = apply {
@@ -40,7 +40,6 @@ abstract class Bakamh : Madara() {
 
     override val mangaDetailsSelectorStatus = ".post-content_item:contains(状态) .summary-content"
 
-    // Site keeps renaming the chapter <li> class, so match the list structure instead
     override fun chapterListSelector() = "ul.version-chap > li"
 
     override val chapterDateSelector = "span.chapter-release-date i"
@@ -62,22 +61,27 @@ abstract class Bakamh : Madara() {
     @Volatile
     private var readerScript: ReaderScript? = null
 
-    override suspend fun fetchChapterDocument(chapterUrl: String) = super.fetchChapterDocument(chapterUrl).also { document ->
-        if (document.selectFirst(READER_CONFIG_SELECTOR) == null) return@also
-        sendReaderBeacon(chapterUrl)
+    override suspend fun fetchChapterDocument(chapterUrl: String): Document {
+        val rawDoc = super.fetchChapterDocument(chapterUrl)
+        // 确保拿到的是解密后的文档
+        val document = ensureDecrypted(rawDoc)
 
-        val hasDirectImages = document.selectFirst("div.reading-content img[data-src], div.reading-content img[src]") != null
-        if (hasDirectImages) return@also
+        if (document.selectFirst(READER_CONFIG_SELECTOR) != null) {
+            sendReaderBeacon(chapterUrl)
+        }
 
-        val scriptUrl = document.selectFirst("script#mkjp-reader-window-js")?.absUrl("src") ?: return@also
-        if (scriptUrl.isNotEmpty() && readerScript?.url != scriptUrl) {
-            runCatching {
-                readerScript = ReaderScript(scriptUrl, client.get(scriptUrl).body.string())
+        val hasDirectImages = document.selectFirst("div.reading-content img, div.page-break img") != null
+        if (!hasDirectImages) {
+            val scriptUrl = document.selectFirst("script#mkjp-reader-window-js")?.absUrl("src")
+            if (!scriptUrl.isNullOrEmpty() && readerScript?.url != scriptUrl) {
+                runCatching {
+                    readerScript = ReaderScript(scriptUrl, client.get(scriptUrl).body.string())
+                }
             }
         }
+        return document
     }
 
-    // The reader's mkjp_rv beacon; chapters read without it end in the site's third-party tool warning
     private suspend fun sendReaderBeacon(chapterUrl: String) {
         val headers = headersBuilder().set("Referer", chapterUrl).build()
         val body = FormBody.Builder().add("action", "mkjp_rv").build()
@@ -85,13 +89,7 @@ abstract class Bakamh : Madara() {
     }
 
     override fun parsePages(document: Document): List<Page> {
-        val doc = if (document.selectFirst(".btbox") != null || document.html().contains("var raw_key")) {
-            decryptBtWaf(document.html())?.let {
-                Jsoup.parse(it, document.location())
-            } ?: document
-        } else {
-            document
-        }
+        val doc = ensureDecrypted(document)
 
         doc.selectFirst(".mkjp-ea-lock__title")?.let { title ->
             val needsLogin = doc.selectFirst(".mkjp-ea-lock [data-target='#form-login']") != null
@@ -99,23 +97,25 @@ abstract class Bakamh : Madara() {
         }
         doc.selectFirst(".mkjp-tool-warning")?.let { error(it.text()) }
 
-        // 1. 提取 HTML 中包含的所有漫画图片
-        val pages = doc.select("div.reading-content img, div.page-break img").mapNotNull { img ->
+        // 全面扫描各种可能的图片属性，防止漏图
+        val pages = doc.select("div.reading-content img, div.page-break img, img.wp-manga-chapter-img").mapNotNull { img ->
             val url = img.attr("abs:data-src").ifEmpty {
                 img.attr("abs:data-manga-src").ifEmpty {
-                    img.attr("abs:data-lazy-src").ifEmpty {
-                        img.attr("abs:src")
+                    img.attr("abs:data-original").ifEmpty {
+                        img.attr("abs:data-lazy-src").ifEmpty {
+                            img.attr("abs:src")
+                        }
                     }
                 }
             }.trim()
-            url.takeIf { it.isNotEmpty() && !it.startsWith("data:") }
+            url.takeIf { it.isNotEmpty() && !it.startsWith("data:") && !it.contains("placeholder") }
         }
 
         if (pages.isNotEmpty()) {
             return pages.mapIndexed { index, url -> Page(index, doc.location(), url) }
         }
 
-        // 2. 旧版本备用解密
+        // 旧逻辑备用
         val config = doc.selectFirst(READER_CONFIG_SELECTOR)?.data()
         val slots = doc.select(READER_SLOT_SELECTOR).size
         if (!config.isNullOrEmpty() && slots > 0 && readerScript != null) {
@@ -128,16 +128,23 @@ abstract class Bakamh : Madara() {
         error("Failed to read the page list")
     }
 
-    /**
-     * 宝塔 WAF (btwaf) 自动放行与解密拦截器
-     */
+    private fun ensureDecrypted(document: Document): Document {
+        val html = document.html()
+        if (html.contains("var raw_key") && html.contains("var encrypted")) {
+            val decrypted = decryptBtWaf(html)
+            if (!decrypted.isNullOrEmpty()) {
+                return Jsoup.parse(decrypted, document.location())
+            }
+        }
+        return document
+    }
+
     private class BtWafInterceptor : Interceptor {
         override fun intercept(chain: Interceptor.Chain): Response {
             val request = chain.request()
             val userAgent = request.header("User-Agent")
                 ?: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
 
-            // 1. 预先计算宝塔 WAF 放行所需的 Cookie (其值为 User-Agent 的 SHA-256)
             val cookieName = "btwaf-21cb7f37099ce405e82768674d54a499-0711fc5487872cd6"
             val uaHash = MessageDigest.getInstance("SHA-256")
                 .digest(userAgent.toByteArray(Charsets.UTF_8))
@@ -155,7 +162,6 @@ abstract class Bakamh : Madara() {
                 .header("Cookie", newCookie)
                 .build()
 
-            // 同步写入系统 CookieManager
             runCatching {
                 CookieManager.getInstance().setCookie("https://bakamh.com", "$cookieName=$uaHash; Path=/; Max-Age=2592000")
             }
@@ -175,7 +181,6 @@ abstract class Bakamh : Madara() {
                     .build()
             }
 
-            // 2. 兜底方案：如果服务器依然下发了加密挑战页，执行免正则的高效算法解密
             val decryptedHtml = decryptBtWaf(bodyString) ?: bodyString
             return response.newBuilder()
                 .body(decryptedHtml.toResponseBody(contentType))
@@ -184,9 +189,6 @@ abstract class Bakamh : Madara() {
     }
 
     companion object {
-        /**
-         * 零正则、防爆栈的宝塔 WAF AES-GCM 页面解密
-         */
         fun decryptBtWaf(html: String): String? {
             return runCatching {
                 val rawKeyStr = html.substringAfter("var raw_key = [", "")
